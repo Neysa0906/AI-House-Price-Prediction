@@ -1,0 +1,245 @@
+# house_price_with_context.py
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import warnings
+
+CSV_FILE = "house_data_extended.csv"
+
+def load_data(path=CSV_FILE):
+    df = pd.read_csv(path)
+    return df
+
+def basic_eda(df):
+    print("------- Dataset shape:", df.shape)
+    print(df.head())
+    print("\nMissing values:\n", df.isnull().sum())
+    print("\nDescribe numeric:\n", df.describe())
+
+    # Correlation heatmap for numeric columns
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if len(numeric_cols) > 1:
+        plt.figure(figsize=(10,8))
+        sns.heatmap(df[numeric_cols].corr(), annot=True, fmt=".2f")
+        plt.title("Correlation matrix (numeric features)")
+        plt.tight_layout()
+        plt.show()
+
+    # Price distribution (only if column exists)
+    if 'price_lakh' in df.columns:
+        plt.figure(figsize=(6,4))
+        sns.histplot(df['price_lakh'], kde=True)
+        plt.title("Price distribution (lakh INR)")
+        plt.show()
+
+def prepare_features(df):
+    # Features and target
+    X = df.drop(columns=['price_lakh'])
+    y = df['price_lakh']
+
+    # Identify categorical and numerical
+    categorical_cols = ['area', 'location']  # area is city name; location also refines neighborhood
+    numeric_cols = [c for c in X.columns if c not in categorical_cols]
+
+    # Build preprocessing pipeline
+    numeric_transformer = Pipeline(steps=[
+        ('scaler', StandardScaler())
+    ])
+
+    # --- SAFE OneHotEncoder (handles old & new sklearn) ---
+    try:
+        # Newer sklearn (>=1.2) – supports sparse_output
+        ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+    except TypeError:
+        # Older sklearn – fall back to sparse (works, just gives array instead of sparse matrix)
+        ohe = OneHotEncoder(handle_unknown='ignore', sparse=False)
+
+    categorical_transformer = Pipeline(steps=[
+        ('onehot', ohe)
+    ])
+    # ------------------------------------------------------
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_cols),
+            ('cat', categorical_transformer, categorical_cols)
+        ],
+        remainder='drop'
+    )
+
+    return X, y, preprocessor, numeric_cols, categorical_cols
+
+def build_and_evaluate(X, y, preprocessor):
+    # Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Random Forest pipeline
+    rf_pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('regressor', RandomForestRegressor(random_state=42))
+    ])
+
+    # Valid choices for max_features in modern sklearn:
+    # float in (0,1], 'sqrt', 'log2', or None, or integer >=1
+    param_grid = {
+        'regressor__n_estimators': [100, 200],
+        'regressor__max_depth': [None, 10, 20],
+        'regressor__max_features': ['sqrt', 'log2', 0.8, None]
+    }
+
+    # Use warnings filter to show helpful messages but not flood the console
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UserWarning)
+        grid = GridSearchCV(rf_pipeline, param_grid, cv=3, scoring='neg_mean_absolute_error', n_jobs=-1)
+        grid.fit(X_train, y_train)
+
+    print("Best params:", grid.best_params_)
+    best_model = grid.best_estimator_
+
+    # Evaluate
+    y_pred = best_model.predict(X_test)
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
+
+    print(f"Evaluation on test set --> MAE: {mae:.2f} lakh, RMSE: {rmse:.2f} lakh, R2: {r2:.3f}")
+
+    # Feature importance (approx)
+    # Use the fitted preprocessor to get exact transformed feature names
+    try:
+        transformed_feature_names = best_model.named_steps['preprocessor'].get_feature_names_out()
+        feature_names = list(transformed_feature_names)
+    except Exception as e:
+        print("Warning: couldn't use get_feature_names_out() on preprocessor - falling back to manual feature name creation.", e)
+        try:
+            num_features = preprocessor.transformers_[0][2]
+            cat_pipe = preprocessor.transformers_[1][1]
+            ohe = cat_pipe.named_steps['onehot']
+            cat_feature_names = ohe.get_feature_names_out(preprocessor.transformers_[1][2])
+            feature_names = list(num_features) + list(cat_feature_names)
+        except Exception as e2:
+            print("Secondary warning while building feature names, using generic names instead:", e2)
+            total_features = best_model.named_steps['regressor'].n_features_in_
+            feature_names = [f"f_{i}" for i in range(total_features)]
+
+    importances = best_model.named_steps['regressor'].feature_importances_
+
+    # Safety: lengths must match
+    if len(importances) != len(feature_names):
+        print(f"Warning: feature importances length ({len(importances)}) != feature names length ({len(feature_names)}).")
+        min_len = min(len(importances), len(feature_names))
+        importances = importances[:min_len]
+        feature_names = feature_names[:min_len]
+
+    fi = pd.Series(importances, index=feature_names).sort_values(ascending=False).head(20)
+    print("\nTop feature importances:\n", fi)
+
+    # Plot predicted vs actual
+    plt.figure(figsize=(6,6))
+    plt.scatter(y_test, y_pred)
+    plt.xlabel("Actual price (lakh)")
+    plt.ylabel("Predicted price (lakh)")
+    plt.title("Actual vs Predicted")
+    plt.plot([min(y_test), max(y_test)], [min(y_test), max(y_test)], 'r--')
+    plt.tight_layout()
+    plt.show()
+
+    return best_model, feature_names
+
+def save_model(model, filename="house_price_model.joblib"):
+    joblib.dump(model, filename)
+    print("Model saved to", filename)
+
+def predict_example(model, df):
+    # create an example input (use median values from df)
+    example = {
+        'area': ['Pune'],
+        'bhk': [3],
+        'bath': [2],
+        'location': ['Kalyani Nagar'],
+        'year_built': [2014],
+        'sqft': [1300],
+        'parking': [1],
+        'city_development_index': [0.86],
+        'gdp_growth': [6.5],
+        'inflation_rate': [5.0],
+        'crime_rate': [4.2],
+        'local_news_index': [3.2]
+    }
+    ex_df = pd.DataFrame(example)
+    pred = model.predict(ex_df)[0]
+    print(f"\nExample predicted price: {pred:.2f} lakh INR")
+
+def interactive_predict(model, preprocessor, numeric_cols, categorical_cols):
+    print("\n--- Interactive prediction ---")
+    # Collect inputs from user (console)
+    def get_input(prompt, cast, default=None):
+        v = input(f"{prompt} (default {default}): ").strip()
+        if v == "":
+            return default
+        return cast(v)
+
+    area = input("City (e.g., Mumbai): ").strip() or "Pune"
+    bhk = int(input("BHK (e.g., 3): ") or 3)
+    bath = int(input("Bathrooms (e.g., 2): ") or 2)
+    location = input("Location/neighborhood (e.g., Kalyani Nagar): ").strip() or "Kalyani Nagar"
+    year_built = int(input("Year built (e.g., 2014): ") or 2014)
+    sqft = float(input("Built-up area in sqft (e.g., 1300): ") or 1300)
+    parking = int(input("Parking spots (0 or 1 or 2): ") or 1)
+    city_development_index = float(input("City development index (0-1, e.g., 0.86): ") or 0.86)
+    gdp_growth = float(input("GDP growth percent (e.g., 6.5): ") or 6.5)
+    inflation_rate = float(input("Inflation rate percent (e.g., 5.0): ") or 5.0)
+    crime_rate = float(input("Crime index (1-10, higher means more crime): ") or 4.2)
+    local_news_index = float(input("Local news index (1-10, higher = more negative news): ") or 3.2)
+
+    user_df = pd.DataFrame([{
+        'area': area,
+        'bhk': bhk,
+        'bath': bath,
+        'location': location,
+        'year_built': year_built,
+        'sqft': sqft,
+        'parking': parking,
+        'city_development_index': city_development_index,
+        'gdp_growth': gdp_growth,
+        'inflation_rate': inflation_rate,
+        'crime_rate': crime_rate,
+        'local_news_index': local_news_index
+    }])
+
+    pred = model.predict(user_df)[0]
+    print(f"\nPredicted price: {pred:.2f} lakh INR")
+
+def main():
+    df = load_data()
+    basic_eda(df)
+
+    X, y, preprocessor, numeric_cols, categorical_cols = prepare_features(df)
+
+    # Fit the preprocessor first on full X to avoid issues with categories in example inputs
+    preprocessor.fit(X)
+
+    best_model, feature_names = build_and_evaluate(X, y, preprocessor)
+
+    # ------------------ FIXED PART: save the entire trained pipeline ------------------
+    # best_model is the Pipeline returned by GridSearchCV (contains fitted preprocessor + regressor)
+    full_pipeline = best_model
+    save_model(full_pipeline, "house_price_full_pipeline.joblib")
+    # -------------------------------------------------------------------------------
+
+    # Example prediction using the full pipeline
+    predict_example(full_pipeline, df)
+
+    # Optional: console interactive predict
+    # interactive_predict(full_pipeline, preprocessor, numeric_cols, categorical_cols)
+
+if __name__ == "__main__":
+    main()
